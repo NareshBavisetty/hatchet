@@ -1,17 +1,16 @@
-// Copyright 2022-present Kuei-chun Chen. All rights reserved.
+/*
+ * Copyright 2022-present Kuei-chun Chen. All rights reserved.
+ * logv2.go
+ */
 
 package hatchet
 
 import (
 	"bufio"
 	"bytes"
-	"database/sql"
-	"errors"
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -22,6 +21,8 @@ import (
 const (
 	COLLSCAN   = "COLLSCAN"
 	DOLLAR_CMD = "$cmd"
+	LIMIT      = 100
+	TOP_N      = 23
 )
 
 var instance *Logv2
@@ -29,22 +30,25 @@ var instance *Logv2
 // GetLogv2 returns Logv2 instance
 func GetLogv2() *Logv2 {
 	if instance == nil {
-		instance = &Logv2{dbfile: SQLITE3_FILE}
+		instance = &Logv2{url: SQLITE3_FILE}
 	}
 	return instance
 }
 
 // Logv2 keeps Logv2 object
 type Logv2 struct {
-	buildInfo  map[string]interface{}
-	dbfile     string
-	filename   string
-	legacy     bool
-	tableName  string
-	testing    bool //test mode
-	totalLines int
-	verbose    bool
-	version    string
+	buildInfo   map[string]interface{}
+	logname     string
+	legacy      bool
+	hatchetName string
+	isDigest    bool
+	s3client    *S3Client
+	testing     bool //test mode
+	totalLines  int
+	url         string // connection string
+	user        string
+	verbose     bool
+	version     string
 }
 
 // Logv2Info stores logv2 struct
@@ -59,11 +63,12 @@ type Logv2Info struct {
 
 	Attributes Attributes
 	Message    string // remaining legacy message
-	Remote     *Remote
+	Client     *RemoteClient
 }
 
 type Attributes struct {
 	Command            map[string]interface{} `json:"command" bson:"command"`
+	ErrMsg             string                 `json:"errMsg" bson:"errMsg"`
 	Milli              int                    `json:"durationMillis" bson:"durationMillis"`
 	NS                 string                 `json:"ns" bson:"ns"`
 	OriginatingCommand map[string]interface{} `json:"originatingCommand" bson:"originatingCommand"`
@@ -72,119 +77,137 @@ type Attributes struct {
 	Type               string                 `json:"type" bson:"type"`
 }
 
-type Remote struct {
-	Accepted int    `json:"accepted"`
-	Conns    int    `json:"conns"`
-	Ended    int    `json:"ended"`
-	IP       string `json:"ip"`
-	Port     string `json:"port"`
+type RemoteClient struct {
+	Accepted int    `json:"accepted" bson:"accepted"`
+	Conns    int    `json:"conns" bson:"conns"`
+	Ended    int    `json:"ended" bson:"ended"`
+	IP       string `json:"value" bson:"ip"`
+	Port     string `json:"port" bson:"port"`
+
+	Driver  string `bsno:"driver"`  // driver name
+	Version string `bsno:"version"` // driver version
 }
 
 // OpStat stores performance data
 type OpStat struct {
-	AvgMilli     float64 `json:"avg_ms"`        // max millisecond
-	Count        int     `json:"count"`         // number of ops
-	Index        string  `json:"index"`         // index used
-	MaxMilli     int     `json:"max_ms"`        // max millisecond
-	Namespace    string  `json:"ns"`            // database.collectin
-	Op           string  `json:"op"`            // count, delete, find, remove, and update
-	QueryPattern string  `json:"query_pattern"` // query pattern
-	Reslen       int     `json:"total_reslen"`  // total reslen
-	TotalMilli   int     `json:"total_ms"`      // total milliseconds
+	AvgMilli     float64 `json:"avg_ms" bson:"avg_ms"`               // avg millisecond
+	Count        int     `json:"count" bson:"count"`                 // number of ops
+	Index        string  `json:"index" bson:"index"`                 // index used
+	MaxMilli     int     `json:"max_ms" bson:"max_ms"`               // max millisecond
+	Namespace    string  `json:"ns" bson:"ns"`                       // database.collectin
+	Op           string  `json:"op" bson:"op"`                       // count, delete, find, remove, and update
+	QueryPattern string  `json:"query_pattern" bson:"query_pattern"` // query pattern
+	Reslen       int     `json:"total_reslen" bson:"total_reslen"`   // total reslen
+	TotalMilli   int     `json:"total_ms" bson:"total_ms"`           // total milliseconds
 }
 
 type LegacyLog struct {
-	Timestamp string `json:"date"`
-	Severity  string `json:"severity"`
-	Component string `json:"component"`
-	Context   string `json:"context"`
-	Message   string `json:"message"` // remaining legacy message
+	Timestamp string `json:"date" bson:"date"`
+	Severity  string `json:"severity" bson:"severity"`
+	Component string `json:"component" bson:"component"`
+	Context   string `json:"context" bson:"context"`
+	Message   string `json:"message" bson:"message"` // remaining legacy message
+}
+
+type HatchetInfo struct {
+	Arch    string `bson:"arch"`
+	End     string `bson:"end"`
+	Module  string `bson:"module"`
+	Name    string `bson:"name"`
+	OS      string `bson:"os"`
+	Start   string `bson:"start"`
+	Version string `bson:"version"`
+
+	Drivers  []map[string]string
+	Provider string `bson:"region"`
+	Region   string `bson:"provider"`
+}
+
+func (ptr *Logv2) GetDBType() int {
+	if strings.HasPrefix(ptr.url, "mongodb://") || strings.HasPrefix(ptr.url, "mongodb+srv://") {
+		return Mongo
+	}
+	return SQLite3
 }
 
 // Analyze analyzes logs from a file
-func (ptr *Logv2) Analyze(filename string) error {
+func (ptr *Logv2) Analyze(logname string) error {
 	var err error
 	var buf []byte
-	ptr.filename = filename
-
 	var file *os.File
 	var reader *bufio.Reader
-	ptr.filename = filename
-	log.Println("processing", filename)
-	dirname := filepath.Dir(ptr.dbfile)
-	os.Mkdir(dirname, 0755)
-	ptr.tableName = getHatchetName(ptr.filename)
-	log.Println("hatchet table is", ptr.tableName)
-	if file, err = os.Open(filename); err != nil {
-		return err
-	}
-	defer file.Close()
-	if reader, err = gox.NewReader(file); err != nil {
-		return err
-	}
-
-	// check if it's a ptr format
-	if buf, _, err = reader.ReadLine(); err != nil { // 0x0A separator = newline
-		return err
-	}
-
-	if len(buf) == 0 {
-		return errors.New("can't detect file type")
-	}
-
-	str := string(buf)
-	if !regexp.MustCompile("^{.*}$").MatchString(str) {
-		return errors.New("log format not supported")
-	}
-
-	// get total counts of logs
+	ptr.logname = logname
+	ptr.hatchetName = getHatchetName(ptr.logname)
 	if !ptr.legacy {
-		ptr.totalLines, _ = gox.CountLines(reader)
+		log.Println("processing", logname)
+		log.Println("hatchet name is", ptr.hatchetName)
 	}
-	file.Seek(0, 0)
-	if reader, err = gox.NewReader(file); err != nil {
-		return err
+
+	if ptr.s3client != nil {
+		var buf []byte
+		if buf, err = ptr.s3client.GetObject(logname); err != nil {
+			return err
+		}
+		if reader, err = GetBufioReader(buf); err != nil {
+			return err
+		}
+	} else if strings.HasPrefix(logname, "http://") || strings.HasPrefix(logname, "https://") {
+		var username, password string
+		if ptr.user != "" {
+			toks := strings.Split(ptr.user, ":")
+			if len(toks) == 2 {
+				username = toks[0]
+				password = toks[1]
+			}
+		}
+		if ptr.isDigest {
+			if reader, err = GetHTTPDigestContent(logname, username, password); err != nil {
+				return err
+			}
+		} else {
+			if reader, err = GetHTTPContent(logname, username, password); err != nil {
+				return err
+			}
+		}
+	} else {
+		if file, err = os.Open(logname); err != nil {
+			return err
+		}
+		defer file.Close()
+		if reader, err = gox.NewReader(file); err != nil {
+			return err
+		}
+		if !ptr.legacy {
+			log.Println("fast counting", logname, "...")
+			ptr.totalLines, _ = gox.CountLines(reader)
+			log.Println("counted", ptr.totalLines, "lines")
+			if _, err = file.Seek(0, 0); err != nil {
+				return err
+			}
+			if reader, err = gox.NewReader(file); err != nil {
+				return err
+			}
+		}
 	}
 
 	var isPrefix bool
-	var stat OpStat
+	var stat *OpStat
 	index := 0
-	var db *sql.DB
-	var pstmt, cstmt *sql.Stmt
-	var tx *sql.Tx
 	var start, end string
+	var dbase Database
 
 	if !ptr.legacy {
-		db, err = sql.Open("sqlite3", ptr.dbfile)
-		if err != nil {
+		if dbase, err = GetDatabase(ptr.hatchetName); err != nil {
 			return err
 		}
-		defer db.Close()
-
-		log.Println("creating table", ptr.tableName)
-		stmts := getHatchetInitStmt(ptr.tableName)
-		if ptr.verbose {
-			log.Println(stmts)
-		}
-		if _, err = db.Exec(stmts); err != nil {
+		defer dbase.Close()
+		if err = dbase.Begin(); err != nil {
 			return err
 		}
-
-		if tx, err = db.Begin(); err != nil {
-			return err
-		}
-		if pstmt, err = tx.Prepare(getHatchetPreparedStmt(ptr.tableName)); err != nil {
-			return err
-		}
-		defer pstmt.Close()
-		if cstmt, err = tx.Prepare(getClientPreparedStmt(ptr.tableName)); err != nil {
-			return err
-		}
-		defer cstmt.Close()
 	}
 
 	for {
-		if !ptr.testing && !ptr.legacy && index%50 == 0 {
+		if !ptr.testing && !ptr.legacy && index%50 == 0 && ptr.totalLines > 0 {
 			fmt.Fprintf(os.Stderr, "\r%3d%% \r", (100*index)/ptr.totalLines)
 		}
 		if buf, isPrefix, err = reader.ReadLine(); err != nil { // 0x0A separator = newline
@@ -205,6 +228,7 @@ func (ptr *Logv2) Analyze(filename string) error {
 
 		doc := Logv2Info{}
 		if err = bson.UnmarshalExtJSON([]byte(str), false, &doc); err != nil {
+			log.Println("line", index, err)
 			continue
 		}
 
@@ -215,30 +239,26 @@ func (ptr *Logv2) Analyze(filename string) error {
 			ptr.buildInfo = doc.Attr.Map()["buildInfo"].(bson.D).Map()
 		}
 		if ptr.legacy {
-			logstr := fmt.Sprintf("%v.000Z %-2s %-8s [%v] %v", doc.Timestamp.Format(time.RFC3339)[:19],
+			dt := getDateTimeStr(doc.Timestamp)
+			logstr := fmt.Sprintf("%v %-2s %-8s [%v] %v", dt,
 				doc.Severity, doc.Component, doc.Context, doc.Message)
 			if !ptr.testing {
 				fmt.Println(logstr)
 			}
 			continue
 		}
-		if stat, err = AnalyzeSlowOp(&doc); err != nil {
-			stat = OpStat{}
+		stat, _ = AnalyzeSlowOp(&doc)
+		end = getDateTimeStr(doc.Timestamp)
+		if start == "" {
+			start = end
 		}
-		if !ptr.legacy {
-			end =  doc.Timestamp.Format(time.RFC3339);
-			if start == "" {
-				start = end
-			}
-			if _, err = pstmt.Exec(index, end, doc.Severity, doc.Component, doc.Context,
-				doc.Msg, doc.Attributes.PlanSummary, doc.Attr.Map()["type"], doc.Attr.Map()["ns"], doc.Message,
-				stat.Op, stat.QueryPattern, stat.Index, doc.Attributes.Milli, doc.Attributes.Reslen); err != nil {
-				return err
-			}
-			if doc.Remote != nil {
-				rmt := doc.Remote
-				if _, err = cstmt.Exec(index, rmt.IP, rmt.Port, rmt.Conns, rmt.Accepted, rmt.Ended); err != nil {
-					return err
+		dbase.InsertLog(index, end, &doc, stat)
+		if doc.Client != nil {
+			if (doc.Client.Accepted + doc.Client.Ended) > 0 { // record connections
+				dbase.InsertClientConn(index, &doc)
+			} else if doc.Client.Driver != "" {
+				if isAppDriver(doc.Client) {
+					dbase.InsertDriver(index, &doc)
 				}
 			}
 		}
@@ -246,37 +266,27 @@ func (ptr *Logv2) Analyze(filename string) error {
 	if ptr.legacy {
 		return nil
 	}
-	if err = tx.Commit(); err != nil {
+	if err = dbase.Commit(); err != nil {
 		return err
 	}
-	instr := fmt.Sprintf(`INSERT INTO hatchet (name, version, module, arch, os, start, end)
-				VALUES ('%v', '', '', '', '', '%v', '%v');`, ptr.tableName, start, end)
+	info := HatchetInfo{Start: start, End: end}
 	if ptr.buildInfo != nil {
-		var arch, os string
-		b := ptr.buildInfo
 		if ptr.buildInfo["environment"] != nil {
 			env := ptr.buildInfo["environment"].(bson.D).Map()
-			arch, _ = env["distarch"].(string)
-			os, _ = env["distmod"].(string)
+			info.Arch, _ = env["distarch"].(string)
+			info.OS, _ = env["distmod"].(string)
 		}
-		var module interface{}
-		if modules, ok := b["modules"].(bson.A); ok {
+		if modules, ok := ptr.buildInfo["modules"].(bson.A); ok {
 			if len(modules) > 0 {
-				module = modules[0]
+				info.Module, _ = modules[0].(string)
 			}
 		}
-		instr = fmt.Sprintf(`INSERT INTO hatchet (name, version, module, arch, os, start, end)
-			VALUES ('%v', '%v', '%v', '%v', '%v', '%v', '%v');`, ptr.tableName, b["version"], module, arch, os, start, end)
+		info.Version, _ = ptr.buildInfo["version"].(string)
 	}
-	delstr := fmt.Sprintf("DELETE FROM hatchet WHERE name = '%v';", ptr.tableName)
-	db.Exec(delstr)
-	if _, err = db.Exec(instr); err != nil {
+	if err = dbase.UpdateHatchetInfo(info); err != nil {
 		return err
 	}
-	instr = fmt.Sprintf(`INSERT INTO %v_ops
-			SELECT op, COUNT(*), ROUND(AVG(milli),1), MAX(milli), SUM(milli), ns, _index, SUM(reslen), filter
-				FROM %v WHERE op != "" GROUP BY op, ns, filter`, ptr.tableName, ptr.tableName)
-	if _, err = db.Exec(instr); err != nil {
+	if err = dbase.CreateMetaData(); err != nil {
 		return err
 	}
 	if !ptr.testing && !ptr.legacy {
@@ -286,32 +296,23 @@ func (ptr *Logv2) Analyze(filename string) error {
 }
 
 func (ptr *Logv2) PrintSummary() error {
-	if ptr.buildInfo != nil {
-		fmt.Println(gox.Stringify(ptr.buildInfo, "", "  "))
-	}
-	str, err := ptr.GetSlowOpsStats()
+	dbase, err := GetDatabase(ptr.hatchetName)
 	if err != nil {
 		return err
 	}
-	fmt.Println(str)
-	return err
-}
-
-// GetSlowOpsStats prints slow ops stats
-func (ptr *Logv2) GetSlowOpsStats() (string, error) {
-	var maxSize = 20
+	log.Println(GetHatchetSummary(dbase.GetHatchetInfo()))
 	summaries := []string{}
 	var buffer bytes.Buffer
-	buffer.WriteString("\r+----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------+\n")
-	buffer.WriteString(fmt.Sprintf("| Command  |COLLSCAN|avg ms| max ms | Count| %-32s| %-60s |\n", "Namespace", "Query Pattern"))
-	buffer.WriteString("|----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------|\n")
-
-	ops, err := getSlowOps(ptr.tableName, "avg_ms", "DESC", false)
-	if err != nil {
-		return "", err
+	buffer.WriteString("\r+----------+--------+------+------+---------------------------------+----------------------------------------------------+\n")
+	buffer.WriteString(fmt.Sprintf("| Command  |COLLSCAN|avg ms| Count| %-32s| %-50s |\n", "Namespace", "Query Pattern"))
+	buffer.WriteString("|----------+--------+------+------+---------------------------------+----------------------------------------------------|\n")
+	var ops []OpStat
+	if ops, err = dbase.GetSlowOps("avg_ms", "DESC", false); err != nil {
+		return err
 	}
+	lines := 5
 	for count, value := range ops {
-		if count > maxSize {
+		if count > lines {
 			break
 		}
 		str := value.QueryPattern
@@ -323,7 +324,7 @@ func (ptr *Logv2) GetSlowOpsStats() (string, error) {
 			value.Namespace = value.Namespace[:1] + "*" + value.Namespace[(length-31):]
 		}
 		if len(str) > 60 {
-			str = value.QueryPattern[:60]
+			str = value.QueryPattern[:50]
 			idx := strings.LastIndex(str, " ")
 			if idx > 0 {
 				str = value.QueryPattern[:idx]
@@ -331,11 +332,11 @@ func (ptr *Logv2) GetSlowOpsStats() (string, error) {
 		}
 		output := ""
 		collscan := ""
-		if value.Index == "COLLSCAN" {
-			collscan = "COLLSCAN"
+		if value.Index == COLLSCAN {
+			collscan = COLLSCAN
 		}
-		output = fmt.Sprintf("|%-10s %8s %6d %8d %6d %-33s %-62s|\n", value.Op, collscan,
-			int(value.AvgMilli), value.MaxMilli, value.Count, value.Namespace, str)
+		output = fmt.Sprintf("|%-10s %8s %6d %6d %-33s %-52s|\n", value.Op, collscan,
+			int(value.AvgMilli), value.Count, value.Namespace, str)
 		buffer.WriteString(output)
 		if len(value.QueryPattern) > 60 {
 			remaining := value.QueryPattern[len(str):]
@@ -356,20 +357,33 @@ func (ptr *Logv2) GetSlowOpsStats() (string, error) {
 						i -= (60 - len(str))
 					}
 				}
-				output = fmt.Sprintf("|%74s   %-62s|\n", " ", pstr)
+				output = fmt.Sprintf("|%74s   %-52s|\n", " ", pstr)
 				buffer.WriteString(output)
 			}
 		}
-		if value.Index != "" && value.Index != "COLLSCAN" {
-			output = fmt.Sprintf("|...index:  %-128s|\n", value.Index)
+		if value.Index != "" && value.Index != COLLSCAN {
+			output = fmt.Sprintf("|...index: %-110s|\n", value.Index)
 			buffer.WriteString(output)
 		}
 	}
-	buffer.WriteString("+----------+--------+------+--------+------+---------------------------------+--------------------------------------------------------------+\n")
+	buffer.WriteString("+----------+--------+------+------+---------------------------------+----------------------------------------------------+")
 	summaries = append(summaries, buffer.String())
-	if maxSize < len(ops) {
-		summaries = append(summaries, fmt.Sprintf(`top %d of %d lines displayed.`, maxSize, len(ops)))
+	if lines < len(ops) {
+		summaries = append(summaries,
+			fmt.Sprintf(`+ %v: slowest %d of %d ops displayed`, ptr.hatchetName, lines+1, len(ops)))
 	}
-	summaries = append(summaries, "hatchet table is "+ptr.tableName)
-	return strings.Join(summaries, "\n"), err
+	fmt.Println(strings.Join(summaries, "\n"))
+	return err
+}
+
+func isAppDriver(client *RemoteClient) bool {
+	driver := client.Driver
+	version := client.Version
+
+	if driver == "NetworkInterfaceTL" || driver == "MongoDB Internal Client" {
+		return false
+	} else if driver == "mongo-go-driver" && strings.HasSuffix(version, "-cloud") {
+		return false
+	}
+	return true
 }
