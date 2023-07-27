@@ -13,20 +13,30 @@ Note that there are a few indexes created during the logs processings  But, you 
 ## View Available Reports
 The easiest way is to go to the home page `http://localhost:3721` and following the instructions to view available reports.  Each report is also available using its own URL with additional parameters defined in the query string.  Below are a few examples:
 
-- `/tables/{table}` views stats summary of a log file
-- `/tables/{table}/stats/slowops` same as the above
-- `/tables/{table}/stats/slowops?COLLSCAN=true&orderBy=count` views stats summary of COLLSCAN logs and sorted by *count*
-- `/tables/{table}/logs/slowops` views top 25 slowest ops logs
-- `/tables/{table}/logs/slowops?topN=100` views top 100 slowest ops logs
-- `/tables/{table}/logs` views all logs, but limit to first 1,000
-- `/tables/{table}/logs?component=NETWORK` searches logs where *component* = *NETWORK*.  Available option are:
+- `/hatchets/{hatchet}/stats/audit` view audit data
+- `/hatchets/{hatchet}/stats/slowops?COLLSCAN=true&orderBy=count` views stats summary of COLLSCAN logs and sorted by *count*
+- `/hatchets/{hatchet}/logs/slowops` views top 23 slowest ops logs
+- `/hatchets/{hatchet}/logs/slowops?topN=100` views top 100 slowest ops logs
+- `/hatchets/{hatchet}/logs/all` views all logs, and available query string parameters are:
+  - component
+  - context
+  - duration (begin_datetime,end_datetime)
+  - limit ([offset,]limit)
+  - severity
+- `/hatchets/{hatchet}/logs/all?component=NETWORK` searches logs where *component* = *NETWORK*.  Available option are:
   - component
   - context
   - duration (begin_datetime,end_datetime)
   - severity
-- `/tables/{table}/charts/connections[?type={}]` views connections charts
-- `/tables/{table}/charts/ops` views average ops time chart
-- `/tables/{table}/charts/slowops[?type={}]` views ops counts chart
+- `/hatchets/{hatchet}/charts/connections[?type={}]` views connections charts, types are:
+  - accepted
+  - time
+  - total
+- `/hatchets/{hatchet}/charts/ops?type={}` views average ops time chart, types are:
+  - stats
+  - counts
+- `/hatchets/{hatchet}/charts/reslen-ip?ip={}` views response length by IPs chart, types are:
+- `/hatchets/{hatchet}/charts/reslen-ns?ns={}` views response length by IPs chart, types are:
 ```
 
 ## Query SQLite3 Database
@@ -35,7 +45,7 @@ The database file is *data/hatchet.db*; use the *sqlite3* command as below:
 sqlite3 ./data/hatchet.db
 ```
 
-After a log file is processed, 3 tables are created in the SQLite3 database.  Part of the table name are from the processed log file.  For example, a table *mongod*_<hex> (e.g., mongod_1b3d5f7) is created after a log file $HOME/Downloads/**mongod**.log.gz is processed.  The other 2 tables are 1) mongod_<hex>_ops stores stats of slow ops and 2) mongod_<hex>_rmt stores remote clients information.  A few SQL commands follow.
+After a log file is processed, 3 tables are created in the SQLite3 database.  Part of the table name are from the processed log file.  For example, a table *mongod*_{hex} (e.g., mongod_1b3d5f7) is created after a log file $HOME/Downloads/**mongod**.log.gz is processed.  The other 4 tables are 1) mongod_{hex}_ops stores stats of slow ops, 2) mongod_{hex}_clients stores clients information, 3) mongod_{hex}_audit keeps audit data, and 4) mongod_{hex}_drivers to store driver information.  A few SQL commands follow.
 
 ### Query All Data
 ```sqlite3
@@ -43,7 +53,7 @@ SELECT * FROM mongod_1b3d5f7;
 ```
 
 ```sqlite3
-SELECT date, severity, component, context, substr(message, 1, 60) message FROM mongod_1b3d5f7;
+SELECT date, severity, component, context, SUBSTR(message, 1, 60) message FROM mongod_1b3d5f7;
 ```
 
 ```sqlite3
@@ -81,7 +91,8 @@ sqlite3 -header -separator $'\t' ./data/hatchet.db "SELECT * FROM mongod_1b3d5f7
 
 ## Hatchet API
 Hatchet provides a number of APIs to output JSON data. They work similarly to the URLs but with a prefix `/api/hatchet/v1.0`.  The APIs are as follows:
-- /api/hatchet/v1.0/tables/{table}/stats/slowops[?orderyBy=] ; Possible values of *orderBy* are:
+- /api/hatchet/v1.0/hatchets/{hatchet}/stats/audit
+- /api/hatchet/v1.0/hatchets/{hatchet}/stats/slowops[?orderyBy=] ; Possible values of *orderBy* are:
   - op
   - ns
   - count
@@ -89,13 +100,19 @@ Hatchet provides a number of APIs to output JSON data. They work similarly to th
   - max_ms
   - total_ms
   - reslen
-- /api/hatchet/v1.0/tables/{table}/logs
-- /api/hatchet/v1.0/tables/{table}/logs/slowops[?topN=] ; The default value of topN is 25.
+- /api/hatchet/v1.0/hatchets/{hatchet}/logs/all
+- /api/hatchet/v1.0/hatchets/{hatchet}/logs/slowops[?topN=] ; The default value of topN is 23.
 
 ## Output Logs in Legacy Format
 ```bash
 ./dist/hatchet -legacy testdata/mongod.log.gz > mongod_legacy.log
 ```
 
+## In-Memory Mode
+The in-memory mode is good for a quick view of the result and no data is persisted.  When using the in-memory mode, the web server is automatically started.  The in-memory mode is not necessarily faster than using a data file if the computer doesn't have enough memory.
+```bash
+./dist/hatchet -in-memory testdata/mongod.log.gz
+```
+
 ## Docker Build
-See https://hub.docker.com/repository/docker/simagix/hatchet/general for details.
+See https://hub.docker.com/r/simagix/hatchet for details.

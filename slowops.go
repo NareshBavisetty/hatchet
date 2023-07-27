@@ -12,25 +12,36 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 )
 
-var ops = []string{cmdAggregate, cmdCount, cmdDelete, cmdDistinct, cmdFind,
-	cmdFindAndModify, cmdGetMore, cmdInsert, cmdUpdate}
+const (
+	cmdCollstats     = "collstats"
+	cmdCreateIndexes = "createIndexes"
 
-const cmdAggregate = "aggregate"
-const cmdCount = "count"
-const cmdCreateIndexes = "createIndexes"
-const cmdDelete = "delete"
-const cmdDistinct = "distinct"
-const cmdFind = "find"
-const cmdFindAndModify = "findandmodify"
-const cmdGetMore = "getMore"
-const cmdInsert = "insert"
-const cmdRemove = "remove"
-const cmdUpdate = "update"
+	cmdInsert   = "insert"
+	cmdDistinct = "distinct"
+
+	cmdAggregate     = "aggregate"
+	cmdCount         = "count"
+	cmdDelete        = "delete"
+	cmdFind          = "find"
+	cmdFindAndModify = "findandmodify"
+	cmdGetMore       = "getMore"
+	cmdRemove        = "remove"
+	cmdUpdate        = "update"
+)
+
+// AnalyzeLog analyzes slow op log
+func AnalyzeLog(str string) (*OpStat, error) {
+	doc := Logv2Info{}
+	if err := bson.UnmarshalExtJSON([]byte(str), false, &doc); err != nil {
+		return nil, err
+	}
+	return AnalyzeSlowOp(&doc)
+}
 
 // AnalyzeSlowOp analyzes slow ops
-func AnalyzeSlowOp(doc *Logv2Info) (OpStat, error) {
+func AnalyzeSlowOp(doc *Logv2Info) (*OpStat, error) {
 	var err error
-	var stat = OpStat{}
+	stat := &OpStat{}
 
 	c := doc.Component
 	if c != "COMMAND" && c != "QUERY" && c != "WRITE" {
@@ -42,21 +53,35 @@ func AnalyzeSlowOp(doc *Logv2Info) (OpStat, error) {
 	stat.Namespace = doc.Attributes.NS
 	if stat.Namespace == "" {
 		return stat, errors.New("no namespace found")
-		//	} else if strings.HasPrefix(stat.Namespace, "admin.") || strings.HasPrefix(stat.Namespace, "config.") || strings.HasPrefix(stat.Namespace, "local.") {
-		//		stat.Op = DOLLAR_CMD
-		//		return stat, errors.New("system database")
 	} else if strings.HasSuffix(stat.Namespace, ".$cmd") {
 		stat.Op = DOLLAR_CMD
+		if commands, ok := doc.Attr.Map()["command"].(bson.D); ok {
+			if len(commands) > 0 {
+				elem := commands[0]
+				stat.Op = elem.Key
+				if doc.Attributes.NS, ok = elem.Value.(string); !ok {
+					doc.Attributes.NS = stat.Namespace
+				}
+				if !strings.Contains(doc.Attributes.NS, ".") {
+					doc.Attributes.NS = strings.ReplaceAll(stat.Namespace, "$cmd", doc.Attributes.NS)
+				}
+			}
+		}
+		if doc.Attributes.ErrMsg != "" {
+			stat.Index = "ErrMsg: " + doc.Attributes.ErrMsg
+		}
 		return stat, errors.New("system command")
 	}
-
 	if doc.Attributes.PlanSummary != "" { // not insert
 		plan := doc.Attributes.PlanSummary
 		if strings.HasPrefix(plan, "IXSCAN") {
 			stat.Index = plan[len("IXSCAN")+1:]
+			stat.Index = strings.ReplaceAll(stat.Index, ": ", ":")
 		} else {
 			stat.Index = plan
 		}
+	} else if doc.Attributes.ErrMsg != "" {
+		stat.Index = "ErrMsg: " + doc.Attributes.ErrMsg
 	}
 	stat.Reslen = doc.Attributes.Reslen
 	if doc.Attributes.Command == nil {
@@ -73,7 +98,8 @@ func AnalyzeSlowOp(doc *Logv2Info) (OpStat, error) {
 		command = doc.Attributes.OriginatingCommand
 		stat.Op = getOp(command)
 	}
-	if stat.Op == cmdInsert || stat.Op == cmdCreateIndexes {
+	if stat.Op == cmdInsert || stat.Op == cmdDistinct ||
+		stat.Op == cmdCreateIndexes || stat.Op == cmdCollstats {
 		stat.QueryPattern = ""
 	} else if stat.QueryPattern == "" &&
 		(stat.Op == cmdFind || stat.Op == cmdUpdate || stat.Op == cmdRemove || stat.Op == cmdDelete) {
@@ -82,6 +108,8 @@ func AnalyzeSlowOp(doc *Logv2Info) (OpStat, error) {
 			query = command["q"]
 		} else if command["query"] != nil {
 			query = command["query"]
+		} else if command["filter"] != nil {
+			query = command["filter"]
 		}
 
 		if query != nil {
@@ -114,7 +142,14 @@ func AnalyzeSlowOp(doc *Logv2Info) (OpStat, error) {
 			} else {
 				stat.QueryPattern = "{}"
 			}
-			if !strings.Contains(stat.QueryPattern, "$match") && !strings.Contains(stat.QueryPattern, "$sort") &&
+			if strings.Contains(stat.QueryPattern, "$changeStream") {
+				if len(pipeline) > 1 {
+					buf, _ := json.Marshal(pipeline[1])
+					stat.QueryPattern = string(buf)
+				} else {
+					stat.QueryPattern = "{}"
+				}
+			} else if !strings.Contains(stat.QueryPattern, "$match") && !strings.Contains(stat.QueryPattern, "$sort") &&
 				!strings.Contains(stat.QueryPattern, "$facet") && !strings.Contains(stat.QueryPattern, "$indexStats") {
 				stat.QueryPattern = "{}"
 			}
@@ -156,16 +191,17 @@ func AnalyzeSlowOp(doc *Logv2Info) (OpStat, error) {
 	if stat.Op == "" {
 		return stat, nil
 	}
-	re := regexp.MustCompile(`\[1(,1)*\]`)
-	stat.QueryPattern = re.ReplaceAllString(stat.QueryPattern, `[...]`)
-	re = regexp.MustCompile(`\[{\S+}(,{\S+})*\]`) // matches repeated doc {"base64":1,"subType":1}}
-	stat.QueryPattern = re.ReplaceAllString(stat.QueryPattern, `[...]`)
-	re = regexp.MustCompile(`^{("\$match"|"\$sort"):(\S+)}$`)
+	re := regexp.MustCompile(`^{("\$match"|"\$sort"):(\S+)}$`)
 	stat.QueryPattern = re.ReplaceAllString(stat.QueryPattern, `$2`)
 	re = regexp.MustCompile(`^{("(\$facet")):\S+}$`)
 	stat.QueryPattern = re.ReplaceAllString(stat.QueryPattern, `{$1:...}`)
 	re = regexp.MustCompile(`{"\$oid":1}`)
 	stat.QueryPattern = re.ReplaceAllString(stat.QueryPattern, `1`)
+	re = regexp.MustCompile(`("\$n?in"):\[\S+(,\s?\S+)*\]`)
+	stat.QueryPattern = re.ReplaceAllString(stat.QueryPattern, `$1:[...]`)
+	re = regexp.MustCompile(`"(\$?\w+)":`)
+	stat.QueryPattern = re.ReplaceAllString(stat.QueryPattern, ` $1:`)
+	stat.QueryPattern = strings.ReplaceAll(stat.QueryPattern, "}", " }")
 	if isGetMore {
 		stat.Op = cmdGetMore
 	}
@@ -182,6 +218,8 @@ func isRegex(doc map[string]interface{}) bool {
 }
 
 func getOp(command map[string]interface{}) string {
+	ops := []string{cmdAggregate, cmdCollstats, cmdCount, cmdCreateIndexes, cmdDelete, cmdDistinct,
+		cmdFind, cmdFindAndModify, cmdGetMore, cmdInsert, cmdUpdate}
 	for _, v := range ops {
 		if command[v] != nil {
 			return v

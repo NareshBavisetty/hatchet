@@ -8,6 +8,12 @@ import (
 	"strings"
 )
 
+var (
+	SEVERITIES = []string{"F", "E", "W", "I", "D", "D2"}
+	SEVERITY_M = map[string]string{"F": "FATAL", "E": "ERROR", "W": "WARN", "I": "INFO",
+		"D": "DEBUG", "D2": "DEBUG2"}
+)
+
 // GetLogTableTemplate returns HTML
 func GetLogTableTemplate(attr string) (*template.Template, error) {
 	html := getContentHTML()
@@ -36,28 +42,39 @@ func GetLogTableTemplate(attr string) (*template.Template, error) {
 		},
 		"getSeverityOptions": func(item string) template.HTML {
 			arr := []string{}
-			servs := [][2]string{{"FATAL", "F"}, {"ERROR", "E"}, {"WARN", "W"}, {"INFO", "I"}, {"DEBUG", "D"}, {"DEBUG2", "D2"}}
-			for _, v := range servs {
+			for _, v := range SEVERITIES {
 				selected := ""
-				if v[1] == item {
+				if v == item {
 					selected = "SELECTED"
 				}
-				arr = append(arr, fmt.Sprintf("<option value='%v' %v>%v</option>", v[1], selected, v[0]))
+				arr = append(arr, fmt.Sprintf("<option value='%v' %v>%v</option>", v, selected, SEVERITY_M[v]))
 			}
 			return template.HTML(strings.Join(arr, "\n"))
 		},
-		"highligtLog": func(log string) template.HTML {
-			return template.HTML(highlightLog(log))
+		"highlightLog": func(log string, params ...string) template.HTML {
+			return template.HTML(highlightLog(log, params...))
+		},
+		"formatDateTime": func(str string) string {
+			return strings.Replace(str, "T", " ", 1)
 		}}).Parse(html)
 }
 
-func highlightLog(log string) string {
-	re := regexp.MustCompile(`("?planSummary"?:\s?"?\w+"?)`)
+func highlightLog(log string, params ...string) string {
+	re := regexp.MustCompile(`("?(planSummary)"?:\s?"(.*?)")`)
 	log = re.ReplaceAllString(log, "<mark>$1</mark>")
 	re = regexp.MustCompile(`((\d+ms$))`)
 	log = re.ReplaceAllString(log, "<mark>$1</mark>")
 	re = regexp.MustCompile(`(("?(keysExamined|keysInserted|docsExamined|nreturned|nMatched|nModified|ndeleted|ninserted|reslen)"?:)\d+)`)
-	return re.ReplaceAllString(log, "<mark>$1</mark>")
+	log = re.ReplaceAllString(log, "<mark>$1</mark>")
+	re = regexp.MustCompile(`(?i)("?(errMsg)"?:\s?"(.*?)"|planSummary:\s?"?COLLSCAN"?)`)
+	log = re.ReplaceAllString(log, "<span style='color: red; font-weight: bold;'>$1</span>")
+	for _, param := range params {
+		if param != "" {
+			re = regexp.MustCompile("(?i)(" + param + `(:\s?\".*?\")?)`)
+			log = re.ReplaceAllString(log, "<mark>$1</mark>")
+		}
+	}
+	return log
 }
 
 func getSlowOpsLogsTable() string {
@@ -67,15 +84,24 @@ func getSlowOpsLogsTable() string {
 	<table width='100%'>
 		<tr>
 			<th>#</th>
-			<th>log in legacy format</th>
+			<th>date</th>
+			<th>S</th>
+			<th>component</th>
+			<th>context</th>
+			<th>message</th>
 		</tr>
 {{range $n, $value := .Logs}}
 		<tr>
 			<td align='right'>{{ add $n 1 }}</td>
-			<td>{{ highligtLog $value }}</td>
+			<td>{{ formatDateTime $value.Timestamp }}</td>
+			<td>{{ $value.Severity }}</td>
+			<td>{{ $value.Component }}</td>
+			<td>{{ $value.Context }}</td>
+			<td>{{ highlightLog $value.Message }}</td>
 		</tr>
 {{end}}
 	</table>
+	<div style='clear: left;' align='center'><hr/><p/>@simagix</div>
 </div>
 `
 	return template
@@ -83,32 +109,35 @@ func getSlowOpsLogsTable() string {
 
 func getLegacyLogsTable() string {
 	template := `
-<br/>
-<div style="float: left;">
-	<label>component: </label>
+  <div style="float: left; margin-right: 20px; clear: left;">
+	<label><i class="fa fa-leaf"></i></label>
 	<select id='component'>
 		<option value=''>select a component</option>
 		{{getComponentOptions .Component}}
 	</select>
-</div>
+  </div>
 
-<div style="float: left; padding: 0px 0px 0px 20px;">
-	<label>&nbsp;severity: </label>
+  <div style="float: left; margin-right: 20px;">
+	<label><i class="fa fa-exclamation"></i></label>
 	<select id='severity'>
 		<option value=''>select a severity</option>
 		{{getSeverityOptions .Severity}}
 	</select>
-</div>
+  </div>
 
-<div style="float: left; padding: 0px 0px 0px 20px;">
-	<label>&nbsp;context: </label>
-	<input id='context' type='text' value='{{.Context}}' size='25'/>
+  <div style="float: left; margin-right: 20px;">
+	<label><i class="fa fa-search"></i></label>
+	<input id='context' type='text' value='{{.Context}}' size='30'/>
 	<button id="find" onClick="findLogs()" class="button" style="float: right;">Find</button>
-</div>
+  </div>
 
 <p/>
 <div>
-{{ if gt .LogLength 0 }}
+{{ if .Logs }}
+	{{if .HasMore}}
+		<button onClick="javascript:location.href='{{.URL}}'; return false;"
+			class="btn" style="float: right; clear: right"><i class="fa fa-arrow-right"></i></button>
+	{{end}}
 	<table width='100%'>
 		<tr>
 			<th>#</th>
@@ -118,20 +147,26 @@ func getLegacyLogsTable() string {
 			<th>context</th>
 			<th>message</th>
 		</tr>
+	{{$search := .Context}}
+	{{$seq := .Seq}}
 	{{range $n, $value := .Logs}}
 		<tr>
-			<td align='right'>{{ add $n 1 }}</td>
-			<td>{{ $value.Timestamp }}</td>
+			<td align='right'>{{ add $n $seq }}</td>
+			<td>{{ formatDateTime $value.Timestamp }}</td>
 			<td>{{ $value.Severity }}</td>
 			<td>{{ $value.Component }}</td>
 			<td>{{ $value.Context }}</td>
-			<td>{{ highligtLog $value.Message }}</td>
+			<td>{{ highlightLog $value.Message $search }}</td>
 		</tr>
 	{{end}}
 	</table>
+	{{if .HasMore}}
+		<button onClick="javascript:location.href='{{.URL}}'; return false;"
+			class="btn" style="float: right; clear: right;"><i class="fa fa-arrow-right"></i></button>
+	{{end}}
+<div align='center'><hr/><p/>@simagix</div>
 {{end}}
 </div>
-<p/>
 <script>
 	var input = document.getElementById("context");
 	input.addEventListener("keypress", function(event) {
@@ -147,7 +182,7 @@ func getLegacyLogsTable() string {
 		sel = document.getElementById('severity')
 		var severity = sel.options[sel.selectedIndex].value;
 		var context = document.getElementById('context').value
-		window.location.href = '/tables/{{.Table}}/logs?component='+component+'&severity='+severity+'&context='+context;
+		window.location.href = '/hatchets/{{.Hatchet}}/logs/all?component='+component+'&severity='+severity+'&context='+context;
 	}
 </script>
 `
